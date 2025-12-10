@@ -25,11 +25,16 @@ app.use('/api', riwayatStokRoutes);
 
 // Default Route
 app.get('/', (req, res) => {
-    res.json({ message: "RKCafee Backend running on localhost" });
+    res.json({ message: "RKCafee Backend running" });
 });
 
-// Port
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server berjalan di http://localhost:${PORT}`);
-});
+// Jalankan server hanya jika sedang di LOCALHOST
+if (process.env.NODE_ENV !== "production") {
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => {
+        console.log(`Server berjalan di http://localhost:${PORT}`);
+    });
+}
+
+// Export app untuk digunakan Vercel
+module.exports = app;
