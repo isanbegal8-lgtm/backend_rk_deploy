@@ -30,6 +30,7 @@ module.exports = (sequelize) => {
   Order.associate = (models) => {
     Order.belongsTo(models.User, { foreignKey: 'id_user', as: 'kasir' });
     Order.hasMany(models.OrderItem, { foreignKey: 'id_order', as: 'items' });
+
   };
 
   return Order;

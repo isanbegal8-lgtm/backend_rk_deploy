@@ -1,112 +1,169 @@
-const { Order, OrderItem, Menu, sequelize } = require('../models');
-const bahanBakuController = require('./bahanBakuController'); // import controller bahan baku
+const { Menu, BahanBaku, BillOfMaterials, RiwayatStok, Order, OrderItem } = require('../models');
 
-// --- A. CREATE ORDER (Transaksi Database) ---
-exports.createOrder = async (req, res) => {
-  const t = await sequelize.transaction(); // Mulai Transaksi agar aman
-  
-  try {
-    const { id_user, total_bayar, items } = req.body;
-    const id_order = 'ORD-' + Date.now();
+const generateOrderId = async () => {
+  // Ambil order terakhir berdasarkan nomor terbesar
+  const lastOrder = await Order.findOne({
+    order: [['id_order', 'DESC']]
+  });
 
-    // 1. Simpan Header Order
-    await Order.create({
-      id_order,
-      total_bayar,
-      id_user,
-      status_pesanan: 'BARU'
-    }, { transaction: t });
+  let nextNumber = 1;
 
-    // 2. Siapkan data items
-    const itemsData = items.map(item => ({
-      id_order: id_order,
-      id_menu: item.id_menu,
-      jumlah: item.jumlah,
-      subtotal: item.subtotal,
-      catatan: item.catatan
-    }));
-
-    // 3. Simpan Detail Items (Bulk Create)
-    await OrderItem.bulkCreate(itemsData, { transaction: t });
-
-    // 4. Kurangi stok otomatis berdasarkan BOM untuk setiap item
-    for (const item of items) {
-      await bahanBakuController.kurangiStokDariOrder(item.id_menu, item.jumlah, id_user);
-    }
-
-    // 5. Commit (Simpan Permanen)
-    await t.commit();
-    
-    res.status(201).json({ success: true, message: 'Order berhasil', id_order });
-
-  } catch (err) {
-    // Rollback (Batalkan jika error)
-    await t.rollback();
-    res.status(500).json({ success: false, error: err.message });
+  if (lastOrder && lastOrder.id_order) {
+    const lastNumber = parseInt(lastOrder.id_order.replace('ORD-', ''));
+    nextNumber = lastNumber + 1;
   }
+
+  // Format menjadi ORD-0001, ORD-0002, dst.
+  const padded = String(nextNumber).padStart(4, '0');
+  return `ORD-${padded}`;
 };
 
-// --- B. GET KITCHEN ORDERS (Layar Dapur) ---
-exports.getKitchenOrders = async (req, res) => {
-  try {
-    const orders = await Order.findAll({
-      where: { status_pesanan: ['BARU', 'DIBUAT'] },
-      include: [
-        {
-          model: OrderItem,
-          as: 'items',
-          include: [{ model: Menu, as: 'menu_detail', attributes: ['nama_menu'] }]
+
+module.exports = {
+
+  // =============================
+  //  CREATE ORDER
+  // =============================
+  createOrder: async (req, res) => {
+    try {
+      const { nama_menu, jumlah_order, id_user } = req.body;
+
+      const menu = await Menu.findOne({ where: { nama_menu } });
+      if (!menu) {
+        return res.status(404).json({ message: `Menu ${nama_menu} tidak ditemukan` });
+      }
+
+      const id_menu = menu.id_menu;
+      const total_harga = menu.harga * jumlah_order;
+
+      const bomList = await BillOfMaterials.findAll({ where: { id_menu } });
+      if (!bomList.length) {
+        return res.status(400).json({ message: `Menu ${nama_menu} tidak memiliki BOM` });
+      }
+
+      for (const bom of bomList) {
+        const bahan = await BahanBaku.findOne({ where: { id_bahan: bom.id_bahan } });
+
+        const total_pengurangan = bom.jumlah_dibutuhkan * jumlah_order;
+
+        if (bahan.stok_saat_ini < total_pengurangan) {
+          return res.status(400).json({
+            message: `Stok bahan ${bahan.nama_bahan} tidak mencukupi`
+          });
         }
-      ],
-      order: [['tanggal', 'ASC']]
-    });
-    res.json({ success: true, data: orders });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-};
 
-// --- C. GET ALL ORDERS (Riwayat) ---
-exports.getAllOrders = async (req, res) => {
-  try {
-    const orders = await Order.findAll({
-      order: [['tanggal', 'DESC']]
-    });
-    res.json({ success: true, data: orders });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-};
+        bahan.stok_saat_ini -= total_pengurangan;
+        await bahan.save();
 
-// --- D. UPDATE STATUS ---
-exports.updateOrderStatus = async (req, res) => {
+        await RiwayatStok.create({
+          id_bahan: bahan.id_bahan,
+          id_user,
+          jumlah_berubah: -total_pengurangan,
+          jenis_transaksi: 'KURANG',
+          keterangan: `Order ${menu.nama_menu}`,
+          tanggal: new Date()
+        });
+      }
+
+      const newOrder = await Order.create({
+        id_order: await generateOrderId(),
+        id_menu,
+        jumlah_order,
+        total_harga,
+        total_bayar: total_harga,
+        id_user,
+        status: "PENDING",
+        tanggal: new Date()
+      });
+
+      return res.status(201).json({
+        message: "Order berhasil dibuat",
+        order: newOrder
+      });
+
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ message: "Terjadi kesalahan", error: error.message });
+    }
+  },
+
+  // =============================
+  //  UPDATE STATUS ORDER
+  // =============================
+updateOrderStatus: async (req, res) => {
   try {
     const { id } = req.params;
     const { status_pesanan } = req.body;
 
-    const [updated] = await Order.update(
-      { status_pesanan },
-      { where: { id_order: id } }
-    );
+    // Cari order berdasarkan ID
+    const order = await Order.findOne({ where: { id_order: id } });
+    if (!order) {
+      return res.status(404).json({ message: "Order tidak ditemukan" });
+    }
 
-    if (!updated) return res.status(404).json({ success: false, message: 'Order tidak ditemukan' });
+    // Validasi status
+    const allowed = ["BARU", "SEDANG DIBUAT", "SELESAI"];
+    if (!allowed.includes(status_pesanan)) {
+      return res.status(400).json({ 
+        message: "Status tidak valid. Gunakan: BARU, SEDANG DIBUAT, SELESAI" 
+      });
+    }
 
-    res.json({ success: true, message: 'Status order diperbarui' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    // Update status
+    order.status_pesanan = status_pesanan;
+    await order.save();
+
+    return res.json({
+      message: "Status order berhasil diperbarui",
+      order
+    });
+
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({
+      message: "Terjadi kesalahan",
+      error: error.message
+    });
   }
-};
+},
 
-// --- E. DELETE ORDER (Void) ---
-exports.deleteOrder = async (req, res) => {
+
+  // =============================
+  //  LAYAR DAPUR
+  // =============================
+  getKitchenOrders: async (req, res) => {
   try {
-    const { id } = req.params;
-    const deleted = await Order.destroy({ where: { id_order: id } });
+    const orders = await Order.findAll({
+      where: {
+        status_pesanan: ['BARU', 'SEDANG DIBUAT', 'SELESAI']
+      },
+      include: [
+        {
+          model: OrderItem,
+          as: 'items',
+          include: [
+            {
+              model: Menu,
+              as: 'menu_detail', // sesuai model kamu
+              attributes: ['nama_menu', 'harga']
+            }
+          ]
+        }
+      ],
+      order: [['tanggal', 'ASC']]
+    });
 
-    if (!deleted) return res.status(404).json({ success: false, message: 'Order tidak ditemukan' });
+    return res.json({
+      message: "Daftar order untuk dapur",
+      total: orders.length,
+      orders
+    });
 
-    res.json({ success: true, message: 'Order berhasil dihapus' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Terjadi kesalahan", error: error.message });
   }
+}
+
+
 };
